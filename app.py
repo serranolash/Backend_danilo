@@ -8,7 +8,7 @@ CORS(app)
 
 DB_FILE = "appointments.db.json"
 
-# Cargar DB en memoria
+# Crear archivo si no existe
 if not os.path.exists(DB_FILE):
     with open(DB_FILE, "w") as f:
         json.dump([], f)
@@ -21,9 +21,13 @@ def save_db(data):
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}, 200
+
 @app.get("/api/appointments")
 def get_appointments():
-    return jsonify(load_db())
+    return jsonify(load_db()), 200
 
 @app.post("/api/appointments")
 def create_appointment():
@@ -34,5 +38,5 @@ def create_appointment():
     return jsonify({"status": "ok", "saved": data}), 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
