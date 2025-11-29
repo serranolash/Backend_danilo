@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
 import os
+from datetime import datetime
+from flask import request, jsonify
 
 APP_FILE = "appointments.json"
 
@@ -82,6 +84,47 @@ def update_appointment(appt_id):
     appointments[idx]["status"] = status
     save_appointments(appointments)
     return jsonify(appointments[idx])
+
+@app.route("/api/appointments/cleanup", methods=["POST"])
+def cleanup_appointments():
+    """
+    Elimina turnos cuya fecha sea anterior a la fecha `before` (YYYY-MM-DD)
+    que llega en el body JSON.
+    """
+    data = request.get_json(silent=True) or {}
+    before = data.get("before")  # ej: "2025-11-01"
+
+    if not before:
+        return jsonify({"error": "Campo 'before' requerido (YYYY-MM-DD)"}), 400
+
+    try:
+        limit = datetime.fromisoformat(before)
+    except ValueError:
+        return jsonify({"error": "Formato de fecha inválido"}), 400
+
+    appointments = load_appointments()
+    kept = []
+    removed = []
+
+    for a in appointments:
+        date_str = a.get("dateISO") or a.get("date")
+        if not date_str:
+            kept.append(a)
+            continue
+        try:
+            # soporta strings con o sin 'Z'
+            d = datetime.fromisoformat(date_str.replace("Z", ""))
+        except Exception:
+            kept.append(a)
+            continue
+
+        if d < limit:
+            removed.append(a)
+        else:
+            kept.append(a)
+
+    save_appointments(kept)
+    return jsonify({"removed": len(removed), "kept": len(kept)})
 
 
 if __name__ == "__main__":
