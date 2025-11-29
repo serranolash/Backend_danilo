@@ -3,37 +3,54 @@ from flask_cors import CORS
 import json
 import os
 from datetime import datetime
-from flask import request, jsonify
+from pathlib import Path
 
-APP_FILE = "appointments.json"
+# === RUTAS DE ARCHIVOS ===
+BASE_DIR = Path(__file__).resolve().parent
+APP_FILE = BASE_DIR / "appointments.json"
+SERVICES_FILE = BASE_DIR / "services.json"
+STYLISTS_FILE = BASE_DIR / "stylists.json"
 
 app = Flask(__name__)
-# Para pruebas: permitir cualquier origen. Podés restringir luego a tu dominio de Netlify.
+# Para pruebas: permitir cualquier origen. Podés restringir luego a tu dominio.
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+# === HELPERS GENERALES PARA JSON ===
+
+def load_json(path: Path, default):
+    """
+    Lee un JSON desde 'path'. Si no existe o falla, devuelve 'default'.
+    """
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+def save_json(path: Path, data):
+    """
+    Guarda 'data' como JSON en 'path'.
+    """
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# === TURNOS (APPOINTMENTS) ===
 
 def load_appointments():
-    if not os.path.exists(APP_FILE):
-        return []
-    try:
-        with open(APP_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
-            return []
-    except Exception:
-        return []
-
+    """
+    Carga la lista de turnos desde appointments.json.
+    """
+    return load_json(APP_FILE, [])
 
 def save_appointments(items):
-    with open(APP_FILE, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
-
+    """
+    Guarda la lista de turnos en appointments.json.
+    """
+    save_json(APP_FILE, items)
 
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "message": "pong"})
-
 
 @app.route("/api/appointments", methods=["GET", "POST"])
 def appointments_collection():
@@ -64,7 +81,6 @@ def appointments_collection():
 
     save_appointments(appointments)
     return jsonify(data), 201
-
 
 @app.route("/api/appointments/<int:appt_id>", methods=["PATCH"])
 def update_appointment(appt_id):
@@ -126,6 +142,56 @@ def cleanup_appointments():
     save_appointments(kept)
     return jsonify({"removed": len(removed), "kept": len(kept)})
 
+# === SERVICIOS Y ESTILISTAS (BACKEND PERSISTENTE) ===
+
+# valores por defecto por si no existen archivos
+DEFAULT_SERVICES = [
+    { "id": 1, "name": "Corte Caballero", "duration": 45, "price": 15000 },
+    { "id": 2, "name": "Corte Dama", "duration": 60, "price": 20000 },
+    { "id": 3, "name": "Tinte Completo", "duration": 90, "price": 40000 },
+    { "id": 4, "name": "Barba & Perfilado", "duration": 30, "price": 12000 },
+]
+
+DEFAULT_STYLISTS = [
+    { "id": 1, "name": "Danilo Dandelo" }
+]
+
+@app.route("/api/services", methods=["GET", "POST"])
+def services_api():
+    """
+    GET  -> devuelve lista de servicios (desde services.json o default)
+    POST -> reemplaza la lista completa de servicios y la persiste
+    """
+    if request.method == "GET":
+        services = load_json(SERVICES_FILE, DEFAULT_SERVICES)
+        return jsonify(services)
+
+    # POST: reemplaza lista completa de servicios
+    data = request.get_json(silent=True)
+    if not isinstance(data, list):
+        return jsonify({"error": "Se espera una lista de servicios"}), 400
+
+    save_json(SERVICES_FILE, data)
+    return jsonify({"ok": True, "count": len(data)})
+
+@app.route("/api/stylists", methods=["GET", "POST"])
+def stylists_api():
+    """
+    GET  -> devuelve lista de estilistas (desde stylists.json o default)
+    POST -> reemplaza la lista completa de estilistas y la persiste
+    """
+    if request.method == "GET":
+        stylists = load_json(STYLISTS_FILE, DEFAULT_STYLISTS)
+        return jsonify(stylists)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, list):
+        return jsonify({"error": "Se espera una lista de estilistas"}), 400
+
+    save_json(STYLISTS_FILE, data)
+    return jsonify({"ok": True, "count": len(data)})
+
+# === MAIN ===
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
