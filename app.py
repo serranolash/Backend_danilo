@@ -100,35 +100,33 @@ def get_twilio_client():
     return Client(account_sid, auth_token)
 
 
-def send_whatsapp_message(phone: str, message: str) -> None:
+def send_whatsapp_message(phone: str, message: str) -> bool:
     """
     Envía un mensaje real de WhatsApp usando Twilio.
-
-    phone: string sólo con dígitos (ej: '5491159121384')
-    message: texto del mensaje a enviar
+    Devuelve True si Twilio aceptó el envío, False si hubo error.
     """
     client = get_twilio_client()
     if client is None:
-        return
+        return False
 
     from_number = os.environ.get("TWILIO_WHATSAPP_FROM")  # ej: 'whatsapp:+14155238886'
     if not from_number:
         app.logger.error("Twilio no configurado: falta TWILIO_WHATSAPP_FROM")
-        return
+        return False
 
-    # Twilio espera el número así: 'whatsapp:+5491159121384'
     to_number = f"whatsapp:+{phone}"
 
     try:
         msg = client.messages.create(
             from_=from_number,
             to=to_number,
-            body=message   # usamos body simple en vez de content_sid para simplificar
+            body=message
         )
         app.logger.info(f"[WHATSAPP] Enviado a {to_number}, SID={msg.sid}")
+        return True
     except Exception as e:
         app.logger.error(f"Error enviando WhatsApp a {to_number}: {e}")
-        # No re-lanzamos excepción para no romper el flujo de la API
+        return False
 
 
 # === TURNOS (APPOINTMENTS) ===
@@ -388,11 +386,12 @@ def whatsapp_reminders():
             "Si no podés asistir, por favor avisá respondiendo este mensaje. 🤘💈"
         )
 
-        try:
-            send_whatsapp_message(phone_norm, message)
+        ok = send_whatsapp_message(phone_norm, message)
+        if ok:
             sent_count += 1
-        except Exception as e:
-            app.logger.error(f"Error enviando WhatsApp a {phone_norm}: {e}")
+        else:
+            app.logger.error(f"No se pudo enviar WhatsApp a {phone_norm}")
+
 
     return jsonify({
         "date": target_date.isoformat(),
