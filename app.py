@@ -1,20 +1,17 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
 import os
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
-import time
+
+from twilio.rest import Client  # 👈 integración real Twilio
 
 # === RUTAS DE ARCHIVOS ===
 BASE_DIR = Path(__file__).resolve().parent
 APP_FILE = BASE_DIR / "appointments.json"
 SERVICES_FILE = BASE_DIR / "services.json"
 STYLISTS_FILE = BASE_DIR / "stylists.json"
-GALLERY_FILE = BASE_DIR / "gallery.json"   # 👈 nuevo JSON para galería
-
-UPLOAD_FOLDER = BASE_DIR / "uploads"       # 👈 carpeta para imágenes
-UPLOAD_FOLDER.mkdir(exist_ok=True)
 
 app = Flask(__name__)
 # Para pruebas: permitir cualquier origen. Podés restringir luego a tu dominio.
@@ -39,6 +36,101 @@ def save_json(path: Path, data):
     """
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
+# === HELPERS FECHAS / TELÉFONOS / WHATSAPP ===
+
+def parse_date_only(value: str):
+    """
+    Recibe un string ISO (ej: '2025-12-04T14:00:00.000Z' o '2025-12-04')
+    y devuelve sólo la fecha (date). Si falla, devuelve None.
+    """
+    if not value:
+        return None
+    try:
+        # soporta strings con o sin 'Z'
+        return datetime.fromisoformat(value.replace("Z", "")).date()
+    except Exception:
+        return None
+
+
+def normalize_phone(raw: str, default_country: str = "54"):
+    """
+    Normaliza teléfonos para WhatsApp en formato numérico, muy simple:
+
+    - Deja sólo dígitos.
+    - Si empieza con '00', quita esos dos dígitos (ej: 0054... -> 54...).
+    - Si empieza con '0' (teléfono local Arg), quita el 0 y antepone el código de país.
+    - Si no empieza con el código de país, lo agrega.
+
+    NO es una validación perfecta, pero sirve como base.
+    """
+    if not raw:
+        return None
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+    if not digits:
+        return None
+
+    # 00xx... -> xx...
+    if digits.startswith("00"):
+        digits = digits[2:]
+
+    # Ya viene con código de país
+    if digits.startswith(default_country):
+        return digits
+
+    # 0 + número local -> agregamos país
+    if digits.startswith("0") and len(digits) >= 10:
+        digits = digits[1:]
+
+    # Agregamos código de país por defecto
+    return default_country + digits
+
+
+def get_twilio_client():
+    """
+    Construye el cliente de Twilio usando variables de entorno.
+    """
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+
+    if not account_sid or not auth_token:
+        app.logger.error("Twilio no configurado: faltan TWILIO_ACCOUNT_SID o TWILIO_AUTH_TOKEN")
+        return None
+
+    return Client(account_sid, auth_token)
+
+
+def send_whatsapp_message(phone: str, message: str) -> None:
+    """
+    Envía un mensaje real de WhatsApp usando Twilio.
+
+    phone: string sólo con dígitos (ej: '5491159121384')
+    message: texto del mensaje a enviar
+    """
+    client = get_twilio_client()
+    if client is None:
+        return
+
+    from_number = os.environ.get("TWILIO_WHATSAPP_FROM")  # ej: 'whatsapp:+14155238886'
+    if not from_number:
+        app.logger.error("Twilio no configurado: falta TWILIO_WHATSAPP_FROM")
+        return
+
+    # Twilio espera el número así: 'whatsapp:+5491159121384'
+    to_number = f"whatsapp:+{phone}"
+
+    try:
+        msg = client.messages.create(
+            from_=from_number,
+            to=to_number,
+            body=message   # usamos body simple en vez de content_sid para simplificar
+        )
+        app.logger.info(f"[WHATSAPP] Enviado a {to_number}, SID={msg.sid}")
+    except Exception as e:
+        app.logger.error(f"Error enviando WhatsApp a {to_number}: {e}")
+        # No re-lanzamos excepción para no romper el flujo de la API
+
+
 # === TURNOS (APPOINTMENTS) ===
 
 def load_appointments():
@@ -47,15 +139,18 @@ def load_appointments():
     """
     return load_json(APP_FILE, [])
 
+
 def save_appointments(items):
     """
     Guarda la lista de turnos en appointments.json.
     """
     save_json(APP_FILE, items)
 
+
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "message": "pong"})
+
 
 @app.route("/api/appointments", methods=["GET", "POST"])
 def appointments_collection():
@@ -74,42 +169,38 @@ def appointments_collection():
     if not all(field in data for field in required_fields):
         return jsonify({"error": "Datos incompletos"}), 400
 
-    # Normalizamos status: por defecto "pendiente" si no viene o es inválido
-    if data.get("status") not in ("pendiente", "confirmado", "cancelado"):
-        data["status"] = "pendiente"
+    # Normalizamos teléfono para WhatsApp (campo adicional, no rompe nada)
+    raw_contact = (data.get("clientContact") or "").strip()
+    data["clientContactNormalized"] = normalize_phone(raw_contact)
 
-    # === LÍMITE: máximo 2 turnos por hora ===
-    date_iso = data.get("dateISO") or data.get("date")
-    time_str = data.get("time")
+    # Límite de máximo 2 turnos por misma fecha & hora (sin contar cancelados)
+    new_date_str = data.get("dateISO") or data.get("date")
+    new_time = data.get("time")
+    new_date_only = parse_date_only(new_date_str)
 
-    if not date_iso or not time_str:
-        return jsonify({"error": "Fecha y hora requeridas"}), 400
+    if new_date_only and new_time:
+        same_slot_count = 0
+        for appt in appointments:
+            appt_date_str = appt.get("dateISO") or appt.get("date")
+            appt_time = appt.get("time")
+            appt_date_only = parse_date_only(appt_date_str)
 
-    day_str = date_iso[:10]  # YYYY-MM-DD
+            if not appt_date_only or not appt_time:
+                continue
 
-    count_existing = 0
-    for a in appointments:
-        a_status = a.get("status", "pendiente")
-        if a_status == "cancelado":
-            continue
+            if (
+                appt_date_only == new_date_only and
+                appt_time == new_time and
+                appt.get("status", "pendiente") != "cancelado"
+            ):
+                same_slot_count += 1
 
-        a_time = a.get("time")
-        a_date_raw = a.get("dateISO") or a.get("date")
-        if not a_time or not a_date_raw:
-            continue
+        if same_slot_count >= 2:
+            return jsonify({
+                "error": "Ya hay 2 turnos agendados para esa fecha y hora."
+            }), 400
 
-        a_day = a_date_raw[:10]
-
-        if a_time == time_str and a_day == day_str:
-            count_existing += 1
-
-    if count_existing >= 2:
-        return jsonify({
-            "error": "La hora seleccionada ya tiene el máximo de turnos.",
-            "code": "TIME_SLOT_FULL"
-        }), 409
-
-    # si ya existe el id, lo reemplazamos
+    # si ya existe el id, lo reemplazamos (por si en el futuro editás)
     existing_idx = next(
         (i for i, a in enumerate(appointments) if a.get("id") == data["id"]),
         None
@@ -117,10 +208,14 @@ def appointments_collection():
     if existing_idx is not None:
         appointments[existing_idx] = data
     else:
+        # estado por defecto
+        if "status" not in data:
+            data["status"] = "pendiente"
         appointments.append(data)
 
     save_appointments(appointments)
     return jsonify(data), 201
+
 
 @app.route("/api/appointments/<int:appt_id>", methods=["PATCH"])
 def update_appointment(appt_id):
@@ -141,6 +236,7 @@ def update_appointment(appt_id):
     save_appointments(appointments)
     return jsonify(appointments[idx])
 
+
 @app.route("/api/appointments/cleanup", methods=["POST"])
 def cleanup_appointments():
     """
@@ -154,7 +250,7 @@ def cleanup_appointments():
         return jsonify({"error": "Campo 'before' requerido (YYYY-MM-DD)"}), 400
 
     try:
-        limit = datetime.fromisoformat(before)
+        limit = datetime.fromisoformat(before).date()
     except ValueError:
         return jsonify({"error": "Formato de fecha inválido"}), 400
 
@@ -164,13 +260,8 @@ def cleanup_appointments():
 
     for a in appointments:
         date_str = a.get("dateISO") or a.get("date")
-        if not date_str:
-            kept.append(a)
-            continue
-        try:
-            # soporta strings con o sin 'Z'
-            d = datetime.fromisoformat(date_str.replace("Z", ""))
-        except Exception:
+        d = parse_date_only(date_str)
+        if not d:
             kept.append(a)
             continue
 
@@ -182,19 +273,21 @@ def cleanup_appointments():
     save_appointments(kept)
     return jsonify({"removed": len(removed), "kept": len(kept)})
 
+
 # === SERVICIOS Y ESTILISTAS (BACKEND PERSISTENTE) ===
 
 # valores por defecto por si no existen archivos
 DEFAULT_SERVICES = [
-    { "id": 1, "name": "Corte Caballero", "duration": 45, "price": 15000 },
-    { "id": 2, "name": "Corte Dama", "duration": 60, "price": 20000 },
-    { "id": 3, "name": "Tinte Completo", "duration": 90, "price": 40000 },
-    { "id": 4, "name": "Barba & Perfilado", "duration": 30, "price": 12000 },
+    {"id": 1, "name": "Corte Caballero", "duration": 45, "price": 15000},
+    {"id": 2, "name": "Corte Dama", "duration": 60, "price": 20000},
+    {"id": 3, "name": "Tinte Completo", "duration": 90, "price": 40000},
+    {"id": 4, "name": "Barba & Perfilado", "duration": 30, "price": 12000},
 ]
 
 DEFAULT_STYLISTS = [
-    { "id": 1, "name": "Danilo Dandelo" }
+    {"id": 1, "name": "Danilo Dandelo"}
 ]
+
 
 @app.route("/api/services", methods=["GET", "POST"])
 def services_api():
@@ -214,11 +307,13 @@ def services_api():
     save_json(SERVICES_FILE, data)
     return jsonify({"ok": True, "count": len(data)})
 
+
 @app.route("/api/stylists", methods=["GET", "POST"])
 def stylists_api():
     """
     GET  -> devuelve lista de estilistas (desde stylists.json o default)
     POST -> reemplaza la lista completa de estilistas y la persiste
+           (incluye galerías, descripciones, etc. si las agregaste en el front)
     """
     if request.method == "GET":
         stylists = load_json(STYLISTS_FILE, DEFAULT_STYLISTS)
@@ -231,100 +326,82 @@ def stylists_api():
     save_json(STYLISTS_FILE, data)
     return jsonify({"ok": True, "count": len(data)})
 
-# === GALERÍA DE FOTOS (TRABAJOS DEL ESTILISTA) ===
 
-def load_gallery():
-    return load_json(GALLERY_FILE, [])
+# === RECORDATORIOS WHATSAPP ===
 
-def save_gallery(items):
-    save_json(GALLERY_FILE, items)
-
-@app.route("/api/gallery", methods=["GET", "POST"])
-def gallery_collection():
+@app.route("/api/reminders/whatsapp", methods=["POST"])
+def whatsapp_reminders():
     """
-    GET  -> devuelve lista de fotos de la galería
-    POST -> agrega un nuevo item a la galería
-    """
-    if request.method == "GET":
-        items = load_gallery()
-        return jsonify(items)
+    Envía recordatorios de WhatsApp para los turnos de una fecha dada.
 
-    # POST: esperamos UN solo item
-    data = request.get_json(silent=True) or {}
-    required = ["id", "title", "imageData"]
-    if not all(field in data for field in required):
-        return jsonify({"error": "Datos incompletos para galería"}), 400
-
-    items = load_gallery()
-
-    # si ya existe un item con ese id, lo reemplazamos (no es grave, solo es seguridad)
-    existing_idx = next((i for i, it in enumerate(items) if it.get("id") == data["id"]), None)
-    if existing_idx is not None:
-        items[existing_idx] = data
-    else:
-        items.append(data)
-
-    save_gallery(items)
-    return jsonify(data), 201
-
-
-@app.route("/api/gallery/<int:item_id>", methods=["DELETE"])
-def delete_gallery_item(item_id):
-    items = load_gallery()
-    new_items = [it for it in items if it.get("id") != item_id]
-    if len(new_items) == len(items):
-        return jsonify({"error": "Elemento no encontrado"}), 404
-    save_gallery(new_items)
-    return jsonify({"ok": True})
-
-@app.route("/api/gallery/upload", methods=["POST"])
-def upload_gallery_image():
-    """
-    Sube un archivo de imagen y crea una entrada en la galería.
-    Espera multipart/form-data con:
-      - file: archivo de imagen
-      - title (opcional)
-      - description (opcional)
-    """
-    if "file" not in request.files:
-        return jsonify({"error": "Archivo 'file' requerido"}), 400
-
-    file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"error": "Nombre de archivo vacío"}), 400
-
-    # nombre único básico
-    ext = os.path.splitext(file.filename)[1].lower()
-    filename = f"gal_{int(time.time() * 1000)}{ext}"
-    file_path = UPLOAD_FOLDER / filename
-    file.save(file_path)
-
-    # URL pública (ajustá si tenés proxy, dominio, etc.)
-    base_url = request.host_url.rstrip("/")
-    image_url = f"{base_url}/uploads/{filename}"
-
-    title = request.form.get("title", "")
-    description = request.form.get("description", "")
-
-    items = load_gallery()
-    new_item = {
-        "id": int(time.time() * 1000),
-        "imageUrl": image_url,
-        "title": title,
-        "description": description,
-        "createdAt": datetime.utcnow().isoformat() + "Z"
+    Body JSON opcional:
+    {
+      "date": "YYYY-MM-DD",      # opcional, si se omite se usa la fecha de hoy (UTC)
+      "only_confirmed": true/false  # opcional, por defecto False => todos menos cancelados
     }
-    items.append(new_item)
-    save_gallery(items)
-
-    return jsonify(new_item), 201
-
-@app.route("/uploads/<path:filename>")
-def serve_upload(filename):
     """
-    Sirve archivos subidos de la carpeta 'uploads'.
-    """
-    return send_from_directory(UPLOAD_FOLDER, filename)
+    data = request.get_json(silent=True) or {}
+
+    date_str = data.get("date")
+    only_confirmed = bool(data.get("only_confirmed", False))
+
+    if date_str:
+        try:
+            target_date = datetime.fromisoformat(date_str).date()
+        except ValueError:
+            return jsonify({"error": "Formato de fecha inválido (usar YYYY-MM-DD)"}), 400
+    else:
+        # por simplicidad usamos hoy UTC; si querés usar hora Arg, podés ajustar.
+        target_date = datetime.utcnow().date()
+
+    appointments = load_appointments()
+    sent_count = 0
+    skipped_no_phone = 0
+    skipped_status = 0
+
+    for appt in appointments:
+        appt_date_str = appt.get("dateISO") or appt.get("date")
+        appt_date_only = parse_date_only(appt_date_str)
+        if appt_date_only != target_date:
+            continue
+
+        status = appt.get("status", "pendiente")
+        if status == "cancelado":
+            skipped_status += 1
+            continue
+        if only_confirmed and status != "confirmado":
+            skipped_status += 1
+            continue
+
+        phone_norm = appt.get("clientContactNormalized") or normalize_phone(appt.get("clientContact"))
+        if not phone_norm:
+            skipped_no_phone += 1
+            continue
+
+        client_name = appt.get("clientName") or "cliente"
+        time_str = appt.get("time") or ""
+        service_name = appt.get("serviceName") or "tu servicio"
+
+        message = (
+            f"Hola {client_name}, te recordamos tu turno hoy a las {time_str} "
+            f"en Dandelo Peluquería para {service_name}. "
+            "Si no podés asistir, por favor avisá respondiendo este mensaje. 🤘💈"
+        )
+
+        try:
+            send_whatsapp_message(phone_norm, message)
+            sent_count += 1
+        except Exception as e:
+            app.logger.error(f"Error enviando WhatsApp a {phone_norm}: {e}")
+
+    return jsonify({
+        "date": target_date.isoformat(),
+        "sent": sent_count,
+        "skipped_no_phone": skipped_no_phone,
+        "skipped_status": skipped_status,
+        "total": len(appointments)
+    })
+
 
 # === MAIN ===
 
