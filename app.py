@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime, date
 from pathlib import Path
+import re  # 👈 para normalizar teléfonos
 
 from twilio.rest import Client  # 👈 integración real Twilio
 
@@ -55,35 +56,41 @@ def parse_date_only(value: str):
 
 def normalize_phone(raw: str, default_country: str = "54"):
     """
-    Normaliza teléfonos para WhatsApp en formato numérico, muy simple:
+    Normaliza teléfonos para WhatsApp, pensado para Argentina.
 
-    - Deja sólo dígitos.
-    - Si empieza con '00', quita esos dos dígitos (ej: 0054... -> 54...).
-    - Si empieza con '0' (teléfono local Arg), quita el 0 y antepone el código de país.
-    - Si no empieza con el código de país, lo agrega.
+    - Deja solo dígitos.
+    - Si empieza con '549' lo deja igual.
+    - Si empieza con '54' pero sin '9', se la agregamos -> '549'.
+    - Si viene como 11xxxxxxxx (CABA), devolvemos '54911xxxxxxxx'.
+    - En cualquier otro caso, le agregamos '549' adelante.
 
-    NO es una validación perfecta, pero sirve como base.
+    Esto apunta a formar números tipo: 5491159121384
+    que Twilio usa como: whatsapp:+5491159121384
     """
     if not raw:
         return None
-    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+
+    digits = re.sub(r"\D+", "", str(raw))
     if not digits:
         return None
 
-    # 00xx... -> xx...
-    if digits.startswith("00"):
-        digits = digits[2:]
-
-    # Ya viene con código de país
-    if digits.startswith(default_country):
+    # ya está bien
+    if digits.startswith("549"):
         return digits
 
-    # 0 + número local -> agregamos país
-    if digits.startswith("0") and len(digits) >= 10:
-        digits = digits[1:]
+    # viene como 54...
+    if digits.startswith("54"):
+        resto = digits[2:]
+        if resto.startswith("9"):
+            return "54" + resto
+        return "549" + resto
 
-    # Agregamos código de país por defecto
-    return default_country + digits
+    # viene como 11xxxxxxxx (CABA)
+    if digits.startswith("11") and len(digits) >= 10:
+        return "549" + digits
+
+    # caso genérico: agregamos 549 adelante
+    return "549" + digits
 
 
 def get_twilio_client():
@@ -104,6 +111,8 @@ def send_whatsapp_message(phone: str, message: str) -> bool:
     """
     Envía un mensaje real de WhatsApp usando Twilio.
     Devuelve True si Twilio aceptó el envío, False si hubo error.
+
+    phone debe venir como '5491159121384' (sin 'whatsapp:' ni '+').
     """
     client = get_twilio_client()
     if client is None:
@@ -356,12 +365,16 @@ def whatsapp_reminders():
     sent_count = 0
     skipped_no_phone = 0
     skipped_status = 0
+    total_for_day = 0  # 👈 sólo los de esa fecha
 
     for appt in appointments:
         appt_date_str = appt.get("dateISO") or appt.get("date")
         appt_date_only = parse_date_only(appt_date_str)
         if appt_date_only != target_date:
             continue
+
+        # sólo contamos los que son de ese día
+        total_for_day += 1
 
         status = appt.get("status", "pendiente")
         if status == "cancelado":
@@ -392,13 +405,12 @@ def whatsapp_reminders():
         else:
             app.logger.error(f"No se pudo enviar WhatsApp a {phone_norm}")
 
-
     return jsonify({
         "date": target_date.isoformat(),
         "sent": sent_count,
         "skipped_no_phone": skipped_no_phone,
         "skipped_status": skipped_status,
-        "total": len(appointments)
+        "total": total_for_day
     })
 
 
