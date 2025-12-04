@@ -242,33 +242,31 @@ def save_gallery(items):
 @app.route("/api/gallery", methods=["GET", "POST"])
 def gallery_collection():
     """
-    GET  -> devuelve la lista de fotos de la galería
-    POST -> agrega una nueva entrada (usando URL de imagen)
+    GET  -> devuelve lista de fotos de la galería
+    POST -> agrega un nuevo item a la galería
     """
-    items = load_gallery()
-
     if request.method == "GET":
+        items = load_gallery()
         return jsonify(items)
 
+    # POST: esperamos UN solo item
     data = request.get_json(silent=True) or {}
-    # Esperamos al menos imageUrl
-    image_url = data.get("imageUrl")
-    if not image_url:
-        return jsonify({"error": "imageUrl requerido"}), 400
+    required = ["id", "title", "imageData"]
+    if not all(field in data for field in required):
+        return jsonify({"error": "Datos incompletos para galería"}), 400
 
-    title = data.get("title") or ""
-    description = data.get("description") or ""
+    items = load_gallery()
 
-    new_item = {
-        "id": int(time.time() * 1000),
-        "imageUrl": image_url,
-        "title": title,
-        "description": description,
-        "createdAt": datetime.utcnow().isoformat() + "Z"
-    }
-    items.append(new_item)
+    # si ya existe un item con ese id, lo reemplazamos (no es grave, solo es seguridad)
+    existing_idx = next((i for i, it in enumerate(items) if it.get("id") == data["id"]), None)
+    if existing_idx is not None:
+        items[existing_idx] = data
+    else:
+        items.append(data)
+
     save_gallery(items)
-    return jsonify(new_item), 201
+    return jsonify(data), 201
+
 
 @app.route("/api/gallery/<int:item_id>", methods=["DELETE"])
 def delete_gallery_item(item_id):
