@@ -69,6 +69,45 @@ def appointments_collection():
     if not all(field in data for field in required_fields):
         return jsonify({"error": "Datos incompletos"}), 400
 
+    # Normalizamos status: por defecto "pendiente" si no viene
+    if "status" not in data or data.get("status") not in ("pendiente", "confirmado", "cancelado"):
+        data["status"] = "pendiente"
+
+    # === NUEVA LÓGICA: limitar a máximo 2 turnos por hora ===
+    date_iso = data.get("dateISO") or data.get("date")
+    time_str = data.get("time")
+
+    if not date_iso or not time_str:
+        return jsonify({"error": "Fecha y hora requeridas"}), 400
+
+    # tomamos solo la parte YYYY-MM-DD
+    day_str = date_iso[:10]
+
+    count_existing = 0
+    for a in appointments:
+        # status por defecto "pendiente" si no existe
+        a_status = a.get("status", "pendiente")
+        if a_status == "cancelado":
+            # los cancelados no ocupan lugar
+            continue
+
+        a_time = a.get("time")
+        a_date_raw = a.get("dateISO") or a.get("date")
+        if not a_time or not a_date_raw:
+            continue
+
+        a_day = a_date_raw[:10]
+
+        if a_time == time_str and a_day == day_str:
+            count_existing += 1
+
+    if count_existing >= 2:
+        # ya hay 2 turnos en esa fecha/hora
+        return jsonify({
+            "error": "La hora seleccionada ya tiene el máximo de turnos.",
+            "code": "TIME_SLOT_FULL"
+        }), 409
+
     # si ya existe el id, lo reemplazamos
     existing_idx = next(
         (i for i, a in enumerate(appointments) if a.get("id") == data["id"]),
