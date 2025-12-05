@@ -4,26 +4,26 @@ import json
 import os
 from datetime import datetime, date
 from pathlib import Path
-import re  # 👈 para normalizar teléfonos
 
-from twilio.rest import Client  # 👈 integración real Twilio
+from twilio.rest import Client  # integración real Twilio
 
 # === RUTAS DE ARCHIVOS ===
 BASE_DIR = Path(__file__).resolve().parent
 APP_FILE = BASE_DIR / "appointments.json"
 SERVICES_FILE = BASE_DIR / "services.json"
 STYLISTS_FILE = BASE_DIR / "stylists.json"
+GALLERY_FILE = BASE_DIR / "gallery.json"   # 👈 NUEVO
 
 app = Flask(__name__)
-# Para pruebas: permitir cualquier origen. Podés restringir luego a tu dominio.
+# Para pruebas: permitir cualquier origen. Luego podés restringir a tu dominio.
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# === HELPERS GENERALES PARA JSON ===
+# =========================
+#  HELPERS JSON
+# =========================
 
 def load_json(path: Path, default):
-    """
-    Lee un JSON desde 'path'. Si no existe o falla, devuelve 'default'.
-    """
+    """Lee un JSON desde 'path'. Si no existe o falla, devuelve 'default'."""
     if not path.exists():
         return default
     try:
@@ -31,14 +31,15 @@ def load_json(path: Path, default):
     except Exception:
         return default
 
+
 def save_json(path: Path, data):
-    """
-    Guarda 'data' como JSON en 'path'.
-    """
+    """Guarda 'data' como JSON en 'path'."""
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# === HELPERS FECHAS / TELÉFONOS / WHATSAPP ===
+# =========================
+#  HELPERS FECHAS / TEL
+# =========================
 
 def parse_date_only(value: str):
     """
@@ -48,7 +49,6 @@ def parse_date_only(value: str):
     if not value:
         return None
     try:
-        # soporta strings con o sin 'Z'
         return datetime.fromisoformat(value.replace("Z", "")).date()
     except Exception:
         return None
@@ -56,47 +56,33 @@ def parse_date_only(value: str):
 
 def normalize_phone(raw: str, default_country: str = "54"):
     """
-    Normaliza teléfonos para WhatsApp, pensado para Argentina.
+    Normaliza teléfonos para WhatsApp en formato numérico muy simple.
 
-    - Deja solo dígitos.
-    - Si empieza con '549' lo deja igual.
-    - Si empieza con '54' pero sin '9', se la agregamos -> '549'.
-    - Si viene como 11xxxxxxxx (CABA), devolvemos '54911xxxxxxxx'.
-    - En cualquier otro caso, le agregamos '549' adelante.
-
-    Esto apunta a formar números tipo: 5491159121384
-    que Twilio usa como: whatsapp:+5491159121384
+    - Deja sólo dígitos.
+    - Si empieza con '00', quita esos dos dígitos (ej: 0054... -> 54...).
+    - Si empieza con '0', quita el 0 y antepone el código de país.
+    - Si no empieza con el código de país, lo agrega.
     """
     if not raw:
         return None
-
-    digits = re.sub(r"\D+", "", str(raw))
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
     if not digits:
         return None
 
-    # ya está bien
-    if digits.startswith("549"):
+    if digits.startswith("00"):
+        digits = digits[2:]
+
+    if digits.startswith(default_country):
         return digits
 
-    # viene como 54...
-    if digits.startswith("54"):
-        resto = digits[2:]
-        if resto.startswith("9"):
-            return "54" + resto
-        return "549" + resto
+    if digits.startswith("0") and len(digits) >= 10:
+        digits = digits[1:]
 
-    # viene como 11xxxxxxxx (CABA)
-    if digits.startswith("11") and len(digits) >= 10:
-        return "549" + digits
-
-    # caso genérico: agregamos 549 adelante
-    return "549" + digits
+    return default_country + digits
 
 
 def get_twilio_client():
-    """
-    Construye el cliente de Twilio usando variables de entorno.
-    """
+    """Construye el cliente de Twilio usando variables de entorno."""
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
 
@@ -111,8 +97,6 @@ def send_whatsapp_message(phone: str, message: str) -> bool:
     """
     Envía un mensaje real de WhatsApp usando Twilio.
     Devuelve True si Twilio aceptó el envío, False si hubo error.
-
-    phone debe venir como '5491159121384' (sin 'whatsapp:' ni '+').
     """
     client = get_twilio_client()
     if client is None:
@@ -138,19 +122,17 @@ def send_whatsapp_message(phone: str, message: str) -> bool:
         return False
 
 
-# === TURNOS (APPOINTMENTS) ===
+# =========================
+#  TURNOS (APPOINTMENTS)
+# =========================
 
 def load_appointments():
-    """
-    Carga la lista de turnos desde appointments.json.
-    """
+    """Carga la lista de turnos desde appointments.json."""
     return load_json(APP_FILE, [])
 
 
 def save_appointments(items):
-    """
-    Guarda la lista de turnos en appointments.json.
-    """
+    """Guarda la lista de turnos en appointments.json."""
     save_json(APP_FILE, items)
 
 
@@ -176,11 +158,11 @@ def appointments_collection():
     if not all(field in data for field in required_fields):
         return jsonify({"error": "Datos incompletos"}), 400
 
-    # Normalizamos teléfono para WhatsApp (campo adicional, no rompe nada)
+    # Normalizar teléfono
     raw_contact = (data.get("clientContact") or "").strip()
     data["clientContactNormalized"] = normalize_phone(raw_contact)
 
-    # Límite de máximo 2 turnos por misma fecha & hora (sin contar cancelados)
+    # Límite de máximo 2 turnos por misma fecha & hora (sin cancelados)
     new_date_str = data.get("dateISO") or data.get("date")
     new_time = data.get("time")
     new_date_only = parse_date_only(new_date_str)
@@ -196,9 +178,9 @@ def appointments_collection():
                 continue
 
             if (
-                appt_date_only == new_date_only and
-                appt_time == new_time and
-                appt.get("status", "pendiente") != "cancelado"
+                appt_date_only == new_date_only
+                and appt_time == new_time
+                and appt.get("status", "pendiente") != "cancelado"
             ):
                 same_slot_count += 1
 
@@ -207,7 +189,7 @@ def appointments_collection():
                 "error": "Ya hay 2 turnos agendados para esa fecha y hora."
             }), 400
 
-    # si ya existe el id, lo reemplazamos (por si en el futuro editás)
+    # upsert por id
     existing_idx = next(
         (i for i, a in enumerate(appointments) if a.get("id") == data["id"]),
         None
@@ -215,7 +197,6 @@ def appointments_collection():
     if existing_idx is not None:
         appointments[existing_idx] = data
     else:
-        # estado por defecto
         if "status" not in data:
             data["status"] = "pendiente"
         appointments.append(data)
@@ -281,9 +262,10 @@ def cleanup_appointments():
     return jsonify({"removed": len(removed), "kept": len(kept)})
 
 
-# === SERVICIOS Y ESTILISTAS (BACKEND PERSISTENTE) ===
+# =========================
+#  SERVICIOS / ESTILISTAS
+# =========================
 
-# valores por defecto por si no existen archivos
 DEFAULT_SERVICES = [
     {"id": 1, "name": "Corte Caballero", "duration": 45, "price": 15000},
     {"id": 2, "name": "Corte Dama", "duration": 60, "price": 20000},
@@ -306,7 +288,6 @@ def services_api():
         services = load_json(SERVICES_FILE, DEFAULT_SERVICES)
         return jsonify(services)
 
-    # POST: reemplaza lista completa de servicios
     data = request.get_json(silent=True)
     if not isinstance(data, list):
         return jsonify({"error": "Se espera una lista de servicios"}), 400
@@ -320,7 +301,6 @@ def stylists_api():
     """
     GET  -> devuelve lista de estilistas (desde stylists.json o default)
     POST -> reemplaza la lista completa de estilistas y la persiste
-           (incluye galerías, descripciones, etc. si las agregaste en el front)
     """
     if request.method == "GET":
         stylists = load_json(STYLISTS_FILE, DEFAULT_STYLISTS)
@@ -334,7 +314,53 @@ def stylists_api():
     return jsonify({"ok": True, "count": len(data)})
 
 
-# === RECORDATORIOS WHATSAPP ===
+# =========================
+#  GALERÍA DE FOTOS
+# =========================
+
+@app.route("/api/gallery", methods=["GET", "POST"])
+def gallery_api():
+    """
+    GET  -> devuelve la lista completa de ítems de galería (gallery.json)
+    POST -> 
+        - si recibe lista -> reemplaza todo
+        - si recibe objeto -> agrega / actualiza por id
+    """
+    if request.method == "GET":
+        items = load_json(GALLERY_FILE, [])
+        return jsonify(items)
+
+    data = request.get_json(silent=True)
+
+    # Lista completa -> reemplazar
+    if isinstance(data, list):
+        save_json(GALLERY_FILE, data)
+        return jsonify({"ok": True, "count": len(data)})
+
+    # Objeto único -> agregar / actualizar
+    if not isinstance(data, dict):
+        return jsonify({"error": "Se espera un objeto o una lista de objetos"}), 400
+
+    items = load_json(GALLERY_FILE, [])
+    item_id = data.get("id") or int(datetime.utcnow().timestamp() * 1000)
+    data["id"] = item_id
+
+    existing_idx = next(
+        (i for i, x in enumerate(items) if x.get("id") == item_id),
+        None
+    )
+    if existing_idx is not None:
+        items[existing_idx] = data
+    else:
+        items.append(data)
+
+    save_json(GALLERY_FILE, items)
+    return jsonify(data), 201
+
+
+# =========================
+#  RECORDATORIOS WHATSAPP
+# =========================
 
 @app.route("/api/reminders/whatsapp", methods=["POST"])
 def whatsapp_reminders():
@@ -343,8 +369,8 @@ def whatsapp_reminders():
 
     Body JSON opcional:
     {
-      "date": "YYYY-MM-DD",      # opcional, si se omite se usa la fecha de hoy (UTC)
-      "only_confirmed": true/false  # opcional, por defecto False => todos menos cancelados
+      "date": "YYYY-MM-DD",          # si se omite, usa hoy (UTC)
+      "only_confirmed": true/false   # por defecto False => todos menos cancelados
     }
     """
     data = request.get_json(silent=True) or {}
@@ -358,23 +384,18 @@ def whatsapp_reminders():
         except ValueError:
             return jsonify({"error": "Formato de fecha inválido (usar YYYY-MM-DD)"}), 400
     else:
-        # por simplicidad usamos hoy UTC; si querés usar hora Arg, podés ajustar.
         target_date = datetime.utcnow().date()
 
     appointments = load_appointments()
     sent_count = 0
     skipped_no_phone = 0
     skipped_status = 0
-    total_for_day = 0  # 👈 sólo los de esa fecha
 
     for appt in appointments:
         appt_date_str = appt.get("dateISO") or appt.get("date")
         appt_date_only = parse_date_only(appt_date_str)
         if appt_date_only != target_date:
             continue
-
-        # sólo contamos los que son de ese día
-        total_for_day += 1
 
         status = appt.get("status", "pendiente")
         if status == "cancelado":
@@ -410,11 +431,13 @@ def whatsapp_reminders():
         "sent": sent_count,
         "skipped_no_phone": skipped_no_phone,
         "skipped_status": skipped_status,
-        "total": total_for_day
+        "total": len(appointments),
     })
 
 
-# === MAIN ===
+# =========================
+#  MAIN
+# =========================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
