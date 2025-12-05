@@ -433,6 +433,35 @@ def whatsapp_reminders():
         "skipped_status": skipped_status,
         "total": len(appointments),
     })
+    
+@app.route("/api/debug/twilio-test", methods=["POST"])
+def twilio_test():
+    """
+    Prueba simple de envío WhatsApp directo a Twilio.
+    Body JSON:
+    {
+      "phone": "1159121384"   # o "+5491159121384", como prefieras
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    raw_phone = data.get("phone")
+    if not raw_phone:
+        return jsonify({"error": "Campo 'phone' requerido"}), 400
+
+    phone_norm = normalize_phone(raw_phone)  # ej: 5491159121384
+    if not phone_norm:
+        return jsonify({"error": "No se pudo normalizar el teléfono"}), 400
+
+    ok = send_whatsapp_message(
+        phone_norm,
+        "⚡ Test Dandelo: si ves este mensaje, Twilio WhatsApp está funcionando."
+    )
+
+    return jsonify({
+        "ok": ok,
+        "phone_normalized": phone_norm
+    })
+    
 
 
 # =========================
